@@ -860,14 +860,14 @@ fn parse_jsonl(
                 let payload = obj.get("payload").unwrap_or(&Value::Null);
                 let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
                 if ptype == "token_count"
-                    && let Some(usage) = payload.pointer("/info/total_token_usage")
+                    && let Some(usage_value) = payload.pointer("/info/total_token_usage")
+                    && let Some(usage) = codex_token_usage(usage_value)
                 {
                     let name = if codex_model.is_empty() {
                         "unknown"
                     } else {
                         &codex_model
                     };
-                    let usage = codex_token_usage(usage);
                     acc.set_usage(
                         name,
                         usage.input_tokens,
@@ -952,10 +952,9 @@ fn parse_jsonl(
             }
             (AGENT_CODEX, "token_usage_record") => {
                 let payload = obj.get("payload").unwrap_or(&Value::Null);
-                let Some(usage_value) = codex_token_usage_candidate(payload) else {
+                let Some(usage) = codex_token_usage_candidate(payload) else {
                     continue;
                 };
-                let usage = codex_token_usage(usage_value);
                 let name = if codex_model.is_empty() {
                     "unknown"
                 } else {
@@ -2652,28 +2651,40 @@ fn shell_segments(command: &str) -> Vec<Vec<String>> {
     segments
 }
 
-fn codex_token_usage(value: &Value) -> TokenUsage {
-    let input = json_i64(value, "input_tokens").max(0);
-    let output = json_i64(value, "output_tokens").max(0);
-    let cache = json_i64(value, "cached_input_tokens").max(0);
+fn codex_token_usage(value: &Value) -> Option<TokenUsage> {
+    let fields = value.as_object()?;
+    let mut input = 0_i64;
+    let mut output = 0_i64;
+    let mut cache = 0_i64;
+    for (key, target) in [
+        ("input_tokens", &mut input),
+        ("output_tokens", &mut output),
+        ("cached_input_tokens", &mut cache),
+    ] {
+        let Some(raw) = fields.get(key) else {
+            continue;
+        };
+        let parsed = raw.as_i64().filter(|value| *value >= 0)?;
+        *target = parsed;
+    }
     let input = input.saturating_sub(cache);
-    TokenUsage {
+    let total = input + output + cache;
+    (total > 0).then_some(TokenUsage {
         input_tokens: input,
         output_tokens: output,
         cache_creation_tokens: 0,
         cache_read_tokens: cache,
-        total_tokens: input + output + cache,
-    }
+        total_tokens: total,
+    })
 }
 
-fn codex_token_usage_candidate(payload: &Value) -> Option<&Value> {
-    ["thread_token_usage", "turn_token_usage", "usage"]
-        .into_iter()
-        .find_map(|key| {
-            payload
-                .get(key)
-                .filter(|value| value.is_object() && codex_token_usage(value).total_tokens > 0)
-        })
+fn codex_token_usage_candidate(payload: &Value) -> Option<TokenUsage> {
+    for key in ["thread_token_usage", "turn_token_usage", "usage"] {
+        if let Some(usage) = payload.get(key).and_then(codex_token_usage) {
+            return Some(usage);
+        }
+    }
+    codex_token_usage(payload)
 }
 
 pub fn codex_total_token_usage(content: &str) -> Option<TokenUsage> {
@@ -2681,14 +2692,14 @@ pub fn codex_total_token_usage(content: &str) -> Option<TokenUsage> {
         let obj: Value = serde_json::from_str(line).ok()?;
         let payload = obj.get("payload")?;
         if obj.get("type").and_then(Value::as_str) == Some("token_usage_record") {
-            return codex_token_usage_candidate(payload).map(codex_token_usage);
+            return codex_token_usage_candidate(payload);
         }
         if payload.get("type").and_then(Value::as_str) != Some("token_count") {
             return None;
         }
         payload
             .pointer("/info/total_token_usage")
-            .map(codex_token_usage)
+            .and_then(codex_token_usage)
     })
 }
 
@@ -5223,9 +5234,9 @@ mod tests {
     #[test]
     fn codex_total_token_usage_invalid_newest_record_falls_back_to_older() {
         let zero_newest = concat!(
-            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"turn_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#,
-            "\n",
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":19184,"cached_input_tokens":0,"output_tokens":11,"total_tokens":19195}}}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"turn_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#,
         );
         assert_eq!(
             codex_total_token_usage(zero_newest).map(|usage| usage.total_tokens),
@@ -5233,9 +5244,9 @@ mod tests {
         );
 
         let malformed_newest = concat!(
-            r#"{"type":"token_usage_record","payload":{"thread_token_usage":"corrupt","turn_token_usage":{"total_tokens":"not-a-number"},"usage":null}}"#,
-            "\n",
             r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":"corrupt","turn_token_usage":{"total_tokens":"not-a-number"},"usage":null}}"#,
         );
         assert_eq!(
             codex_total_token_usage(malformed_newest).map(|usage| usage.total_tokens),
@@ -5310,6 +5321,89 @@ mod tests {
         assert_eq!(session.usage.output_tokens, 10);
         assert_eq!(session.usage.cache_read_tokens, 40);
         assert_eq!(session.usage.total_tokens, 110);
+    }
+
+    #[test]
+    fn codex_total_token_usage_reads_payload_level_fields() {
+        let content = r#"{"type":"token_usage_record","payload":{"thread_token_usage":null,"turn_token_usage":null,"usage":null,"input_tokens":7,"cached_input_tokens":0,"output_tokens":3,"total_tokens":10}}"#;
+
+        let usage = codex_total_token_usage(content).expect("usage");
+
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn codex_total_token_usage_rejects_invalid_legacy_records() {
+        let zero = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0}}}}"#;
+        assert_eq!(codex_total_token_usage(zero), None);
+
+        let malformed = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"corrupt","cached_input_tokens":0,"output_tokens":4}}}}"#;
+        assert_eq!(codex_total_token_usage(malformed), None);
+    }
+
+    #[test]
+    fn codex_token_usage_record_falls_back_to_payload_fields() {
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"type":"token_usage_record","payload":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":3,"total_tokens":10}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 7);
+        assert_eq!(session.usage.output_tokens, 3);
+        assert_eq!(session.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn codex_token_usage_record_corrupt_thread_falls_back_to_turn() {
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":"corrupt","turn_token_usage":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":3,"total_tokens":10}}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 7);
+        assert_eq!(session.usage.output_tokens, 3);
+        assert_eq!(session.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn codex_token_count_invalid_legacy_usage_keeps_prior_totals() {
+        let codex = [
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"corrupt","cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 11);
+        assert_eq!(session.usage.output_tokens, 4);
+        assert_eq!(session.usage.total_tokens, 15);
     }
 
     #[test]
