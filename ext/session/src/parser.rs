@@ -2667,8 +2667,8 @@ fn codex_token_usage(value: &Value) -> Option<TokenUsage> {
         let parsed = raw.as_i64().filter(|value| *value >= 0)?;
         *target = parsed;
     }
-    let input = input.saturating_sub(cache);
-    let total = input + output + cache;
+    let input = input.checked_sub(cache).filter(|value| *value >= 0)?;
+    let total = input.checked_add(output)?.checked_add(cache)?;
     (total > 0).then_some(TokenUsage {
         input_tokens: input,
         output_tokens: output,
@@ -5255,6 +5255,44 @@ mod tests {
 
         let only_invalid = r#"{"type":"token_usage_record","payload":{"thread_token_usage":null,"turn_token_usage":null,"usage":null}}"#;
         assert_eq!(codex_total_token_usage(only_invalid), None);
+    }
+
+    #[test]
+    fn codex_total_token_usage_rejects_cache_exceeding_input_newest_falls_back() {
+        let content = concat!(
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":10,"cached_input_tokens":40,"output_tokens":4,"total_tokens":54}}}"#,
+        );
+        assert_eq!(
+            codex_total_token_usage(content).map(|usage| usage.total_tokens),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn codex_total_token_usage_rejects_total_overflow_newest_falls_back() {
+        let content = concat!(
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":9223372036854775807,"cached_input_tokens":0,"output_tokens":1,"total_tokens":9223372036854775808}}}"#,
+        );
+        assert_eq!(
+            codex_total_token_usage(content).map(|usage| usage.total_tokens),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn codex_total_token_usage_rejects_non_object_negative_and_empty() {
+        let non_object = r#"{"type":"token_usage_record","payload":{"thread_token_usage":"corrupt","turn_token_usage":null,"usage":null}}"#;
+        assert_eq!(codex_total_token_usage(non_object), None);
+
+        let negative = r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":-1,"cached_input_tokens":0,"output_tokens":4,"total_tokens":3}}}"#;
+        assert_eq!(codex_total_token_usage(negative), None);
+
+        let empty = r#"{"type":"token_usage_record","payload":{"thread_token_usage":{},"turn_token_usage":{},"usage":{}}}"#;
+        assert_eq!(codex_total_token_usage(empty), None);
     }
 
     #[test]
