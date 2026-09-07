@@ -952,34 +952,30 @@ fn parse_jsonl(
             }
             (AGENT_CODEX, "token_usage_record") => {
                 let payload = obj.get("payload").unwrap_or(&Value::Null);
-                let token_usage = payload
-                    .get("thread_token_usage")
-                    .or_else(|| payload.get("turn_token_usage"))
-                    .or_else(|| payload.get("usage"))
-                    .unwrap_or(payload);
-                let usage = codex_token_usage(token_usage);
-                if usage.total_tokens > 0 {
-                    let name = if codex_model.is_empty() {
-                        "unknown"
-                    } else {
-                        &codex_model
-                    };
-                    acc.set_usage(
-                        name,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        0,
-                        usage.cache_read_tokens,
-                        usage.total_tokens,
-                    );
-                    if let Some(last) = events.llm_responses.last_mut()
-                        && last.total_tokens == 0
-                    {
-                        last.input_tokens = usage.input_tokens as u64;
-                        last.output_tokens = usage.output_tokens as u64;
-                        last.cache_tokens = usage.cache_read_tokens as u64;
-                        last.total_tokens = usage.total_tokens as u64;
-                    }
+                let Some(usage_value) = codex_token_usage_candidate(payload) else {
+                    continue;
+                };
+                let usage = codex_token_usage(usage_value);
+                let name = if codex_model.is_empty() {
+                    "unknown"
+                } else {
+                    &codex_model
+                };
+                acc.set_usage(
+                    name,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    0,
+                    usage.cache_read_tokens,
+                    usage.total_tokens,
+                );
+                if let Some(last) = events.llm_responses.last_mut()
+                    && last.total_tokens == 0
+                {
+                    last.input_tokens = usage.input_tokens as u64;
+                    last.output_tokens = usage.output_tokens as u64;
+                    last.cache_tokens = usage.cache_read_tokens as u64;
+                    last.total_tokens = usage.total_tokens as u64;
                 }
             }
             (AGENT_CODEX, "response_item")
@@ -2670,16 +2666,22 @@ fn codex_token_usage(value: &Value) -> TokenUsage {
     }
 }
 
+fn codex_token_usage_candidate(payload: &Value) -> Option<&Value> {
+    ["thread_token_usage", "turn_token_usage", "usage"]
+        .into_iter()
+        .find_map(|key| {
+            payload
+                .get(key)
+                .filter(|value| value.is_object() && codex_token_usage(value).total_tokens > 0)
+        })
+}
+
 pub fn codex_total_token_usage(content: &str) -> Option<TokenUsage> {
     content.lines().rev().find_map(|line| {
         let obj: Value = serde_json::from_str(line).ok()?;
         let payload = obj.get("payload")?;
         if obj.get("type").and_then(Value::as_str) == Some("token_usage_record") {
-            let usage = payload
-                .get("thread_token_usage")
-                .or_else(|| payload.get("turn_token_usage"))
-                .or_else(|| payload.get("usage"))?;
-            return Some(codex_token_usage(usage));
+            return codex_token_usage_candidate(payload).map(codex_token_usage);
         }
         if payload.get("type").and_then(Value::as_str) != Some("token_count") {
             return None;
@@ -5205,6 +5207,109 @@ mod tests {
             codex_total_token_usage(record_first).map(|usage| usage.total_tokens),
             Some(19_195)
         );
+    }
+
+    #[test]
+    fn codex_total_token_usage_prefers_first_valid_candidate() {
+        let content = r#"{"type":"token_usage_record","payload":{"thread_token_usage":null,"turn_token_usage":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":3,"total_tokens":10},"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"total_tokens":2}}}"#;
+
+        let usage = codex_total_token_usage(content).expect("usage");
+
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn codex_total_token_usage_invalid_newest_record_falls_back_to_older() {
+        let zero_newest = concat!(
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"turn_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":19184,"cached_input_tokens":0,"output_tokens":11,"total_tokens":19195}}}}"#,
+        );
+        assert_eq!(
+            codex_total_token_usage(zero_newest).map(|usage| usage.total_tokens),
+            Some(19_195)
+        );
+
+        let malformed_newest = concat!(
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":"corrupt","turn_token_usage":{"total_tokens":"not-a-number"},"usage":null}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+        );
+        assert_eq!(
+            codex_total_token_usage(malformed_newest).map(|usage| usage.total_tokens),
+            Some(15)
+        );
+
+        let only_invalid = r#"{"type":"token_usage_record","payload":{"thread_token_usage":null,"turn_token_usage":null,"usage":null}}"#;
+        assert_eq!(codex_total_token_usage(only_invalid), None);
+    }
+
+    #[test]
+    fn codex_token_usage_record_skips_null_thread_usage() {
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":null,"turn_token_usage":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":3,"total_tokens":10}}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 7);
+        assert_eq!(session.usage.output_tokens, 3);
+        assert_eq!(session.usage.cache_read_tokens, 0);
+        assert_eq!(session.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn codex_token_usage_record_invalid_newest_keeps_older_totals() {
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0},"turn_token_usage":null,"usage":{"total_tokens":"oops"}}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 11);
+        assert_eq!(session.usage.output_tokens, 4);
+        assert_eq!(session.usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn codex_token_usage_record_keeps_cached_input_arithmetic() {
+        let codex = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10,"total_tokens":150}}}"#,
+        ]
+        .join("\n");
+
+        let session = parse_session_content(
+            AGENT_CODEX,
+            &PathBuf::from("/tmp/session.jsonl"),
+            UNIX_EPOCH,
+            &codex,
+        )
+        .expect("session");
+
+        assert_eq!(session.usage.input_tokens, 60);
+        assert_eq!(session.usage.output_tokens, 10);
+        assert_eq!(session.usage.cache_read_tokens, 40);
+        assert_eq!(session.usage.total_tokens, 110);
     }
 
     #[test]
