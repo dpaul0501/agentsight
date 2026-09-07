@@ -2674,6 +2674,13 @@ pub fn codex_total_token_usage(content: &str) -> Option<TokenUsage> {
     content.lines().rev().find_map(|line| {
         let obj: Value = serde_json::from_str(line).ok()?;
         let payload = obj.get("payload")?;
+        if obj.get("type").and_then(Value::as_str) == Some("token_usage_record") {
+            let usage = payload
+                .get("thread_token_usage")
+                .or_else(|| payload.get("turn_token_usage"))
+                .or_else(|| payload.get("usage"))?;
+            return Some(codex_token_usage(usage));
+        }
         if payload.get("type").and_then(Value::as_str) != Some("token_count") {
             return None;
         }
@@ -5164,6 +5171,40 @@ mod tests {
         assert_eq!(session.usage.cache_read_tokens, 9_984);
         assert_eq!(session.usage.output_tokens, 11);
         assert_eq!(session.usage.total_tokens, 19_195);
+    }
+
+    #[test]
+    fn codex_total_token_usage_reads_mid_turn_token_usage_record() {
+        let content = r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":11,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0,"total_tokens":15},"turn_token_usage":{"input_tokens":11,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0,"total_tokens":15},"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0,"total_tokens":15}}}"#;
+
+        let usage = codex_total_token_usage(content).expect("usage");
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn codex_total_token_usage_newest_record_wins() {
+        let legacy_first = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":19184,"cached_input_tokens":0,"output_tokens":11,"total_tokens":19195}}}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+        );
+        let record_first = concat!(
+            r#"{"type":"token_usage_record","payload":{"thread_token_usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":4,"total_tokens":15}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":19184,"cached_input_tokens":0,"output_tokens":11,"total_tokens":19195}}}}"#,
+        );
+
+        assert_eq!(
+            codex_total_token_usage(legacy_first).map(|usage| usage.total_tokens),
+            Some(15)
+        );
+        assert_eq!(
+            codex_total_token_usage(record_first).map(|usage| usage.total_tokens),
+            Some(19_195)
+        );
     }
 
     #[test]
